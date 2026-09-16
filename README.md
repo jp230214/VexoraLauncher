@@ -2,7 +2,7 @@ Vexora Launcher
 
 A modern Minecraft launcher built with Rust. 💜
 
-Vexora is designed to be fast, lightweight, customizable, and easy to use, while providing all  tools you need for managing Minecraft instances.
+Vexora is designed to be fast, lightweight, customizable, and easy to use, while providing all  tools you need for managing Minecraft.
 
 ✨ Features
 

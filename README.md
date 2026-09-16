@@ -23,4 +23,4 @@ Rust
 GPUI
 Cargo
 
-- vexthatguy :D
+-- vexthatguy :D

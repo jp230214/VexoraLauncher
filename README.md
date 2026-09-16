@@ -20,8 +20,8 @@ Vexora is designed to be fast, lightweight, customizable, and easy to use, while
 Vexora Launcher is currently in active development. Features and UI are still being improved and expanded.
 
 🛠️ Built With
-Rust
-GPUI
-Cargo
+- Rust
+- GPUI
+- Cargo
 
--- vexthatguy :D
+-- made by vexthatguy :D

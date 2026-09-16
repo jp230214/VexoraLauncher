@@ -1,0 +1,567 @@
+use std::{cmp::Ordering, io::Write, path::Path, sync::Arc, time::Duration};
+
+use bridge::instance::InstanceContentSummary;
+use gpui::{App, BorrowAppContext, SharedString, Task};
+use rand::RngCore;
+use schema::{curseforge::CurseforgeClassId, modrinth::ModrinthProjectType};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    component::named_dropdown::DropdownName, pages::instance::instance_page::InstanceSubpageType,
+    ui::PageType,
+};
+
+struct InterfaceConfigHolder {
+    config: InterfaceConfig,
+    write_task: Option<Task<()>>,
+    path: Arc<Path>,
+}
+
+impl gpui::Global for InterfaceConfigHolder {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InterfaceConfig {
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub language: t::Language,
+
+    // Theme
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub active_theme: Option<SharedString>,
+    /// True only for a config that has never been saved/loaded (fresh
+    /// install). Lets startup apply the Vexora Dark default exactly once
+    /// without clobbering an explicit "Default Dark" choice afterwards:
+    /// that choice is stored as `active_theme: None` and must stick.
+    /// Missing in existing files -> false (never override saved themes).
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub first_run: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub font_family: Option<SharedString>,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub font_size: Option<i32>,
+
+    // Window state
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub main_window_bounds: WindowBounds,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub sidebar_width: f32,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub main_page: PageType,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub page_path: Arc<[PageType]>,
+
+    // Instance management
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub import_launcher_dirs: std::collections::HashMap<String, String>,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub quick_delete_mods: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub quick_delete_instance: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub preferred_add_content_source: PreferredAddContentSource,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_mods_sort_key: InstanceContentSortKey,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_mods_sort_enabled_first: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_resourcepacks_sort_key: InstanceContentSortKey,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_resourcepacks_sort_enabled_first: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_shaders_sort_key: InstanceContentSortKey,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_shaders_sort_enabled_first: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub show_snapshots_in_create_instance: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instances_view_mode: InstancesViewMode,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub instance_subpage: InstanceSubpageType,
+
+    // Content
+    #[serde(
+        default = "schema::default_true",
+        deserialize_with = "schema::try_deserialize"
+    )]
+    pub content_install_latest: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub content_filter_version: bool,
+    #[serde(
+        default = "default_modrinth_project_type",
+        deserialize_with = "schema::try_deserialize"
+    )]
+    pub modrinth_page_project_type: ModrinthProjectType,
+    #[serde(
+        default = "default_curseforge_class_id",
+        deserialize_with = "schema::try_deserialize"
+    )]
+    pub curseforge_page_class_id: CurseforgeClassId,
+
+    // Window options
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub hide_main_window_on_launch: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub live_game_output_display: LiveGameOutputDisplay,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub quit_on_main_closed: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub use_os_titlebar: bool,
+
+    // Privacy options
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub hide_usernames: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub hide_skins: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub hide_server_addresses: bool,
+
+    // Skins page
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub collapse_capes_in_skins_page: bool,
+    #[serde(default, deserialize_with = "schema::try_deserialize")]
+    pub skin_list_sort_desc: bool,
+    #[serde(
+        default = "schema::default_true",
+        deserialize_with = "schema::try_deserialize"
+    )]
+    pub skin_list_show_3d: bool,
+    #[serde(default = "default_zoom", deserialize_with = "schema::try_deserialize")]
+    pub player_model_zoom: i32,
+}
+
+pub const DEFAULT_THEME: &'static str = "Default Dark";
+
+#[cfg(windows)]
+pub const DEFAULT_FONT: &'static str = "Inter 24pt 24pt";
+#[cfg(not(windows))]
+pub const DEFAULT_FONT: &'static str = "Inter 24pt";
+
+pub const DEFAULT_FONT_SIZE: i32 = 16;
+
+impl InterfaceConfig {
+    pub fn set_active_theme(&mut self, theme: SharedString) {
+        if theme == DEFAULT_THEME {
+            self.active_theme = None;
+        } else {
+            self.active_theme = Some(theme);
+        }
+    }
+
+    pub fn set_font_family(&mut self, font_family: SharedString) {
+        if font_family == DEFAULT_FONT {
+            self.font_family = None;
+        } else {
+            self.font_family = Some(font_family);
+        }
+    }
+
+    pub fn set_font_size(&mut self, font_size: i32) {
+        if font_size == DEFAULT_FONT_SIZE {
+            self.font_size = None;
+        } else {
+            self.font_size = Some(font_size);
+        }
+    }
+
+    pub fn apply_theme(cx: &mut App, log: bool) {
+        cx.update_global::<InterfaceConfigHolder, _>(|holder, cx| {
+            let registry = gpui_component::ThemeRegistry::global(cx);
+            let theme_config = if let Some(active_theme) = &holder.config.active_theme {
+                if let Some(theme_config) = registry.themes().get(active_theme).cloned() {
+                    theme_config
+                } else {
+                    if log {
+                        log::warn!(
+                            "Unable to find theme with name {}, using default theme",
+                            active_theme
+                        );
+                    }
+                    registry.default_dark_theme().clone()
+                }
+            } else {
+                // No explicit selection means the built-in Default Dark.
+                // Look it up by name (rather than trusting the mutable
+                // default slot) so a folder theme can never silently
+                // replace what "Default Dark" resolves to.
+                registry
+                    .themes()
+                    .get(&SharedString::new_static(DEFAULT_THEME))
+                    .cloned()
+                    .unwrap_or_else(|| registry.default_dark_theme().clone())
+            };
+
+            let theme = gpui_component::Theme::global_mut(cx);
+
+            theme.apply_config(&theme_config);
+
+            theme.font_family = holder
+                .config
+                .font_family
+                .clone()
+                .unwrap_or(SharedString::new_static(DEFAULT_FONT));
+            theme.font_size = gpui::px(
+                holder
+                    .config
+                    .font_size
+                    .unwrap_or(DEFAULT_FONT_SIZE)
+                    .clamp(8, 32) as f32,
+            );
+            theme.scrollbar_mode = gpui_component::scroll::ScrollbarMode::Always;
+        });
+        cx.refresh_windows();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::EnumIter)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveGameOutputDisplay {
+    #[default]
+    TabOnInstancePage,
+    SeparateWindow,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::EnumIter)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceContentSortKey {
+    #[default]
+    Name,
+    ModId,
+    Filename,
+    ModifiedTime,
+    FileSize,
+}
+
+impl InstanceContentSortKey {
+    pub fn name(self) -> DropdownName {
+        match self {
+            InstanceContentSortKey::Name => {
+                DropdownName::translated(t::instance::content::sort_key::name)
+            }
+            InstanceContentSortKey::ModId => {
+                DropdownName::translated(t::instance::content::sort_key::mod_id)
+            }
+            InstanceContentSortKey::Filename => {
+                DropdownName::translated(t::instance::content::sort_key::filename)
+            }
+            InstanceContentSortKey::ModifiedTime => {
+                DropdownName::translated(t::instance::content::sort_key::modified_time)
+            }
+            InstanceContentSortKey::FileSize => {
+                DropdownName::translated(t::instance::content::sort_key::filesize)
+            }
+        }
+    }
+
+    pub fn compare(self, a: &InstanceContentSummary, b: &InstanceContentSummary) -> Ordering {
+        match self {
+            InstanceContentSortKey::Name => {
+                let name_a = a
+                    .content_summary
+                    .name
+                    .as_deref()
+                    .or(a.content_summary.id.as_deref())
+                    .unwrap_or(&*a.filename);
+                let name_b = b
+                    .content_summary
+                    .name
+                    .as_deref()
+                    .or(b.content_summary.id.as_deref())
+                    .unwrap_or(&*b.filename);
+                lexical_sort::natural_lexical_cmp(name_a, name_b)
+            }
+            InstanceContentSortKey::ModId => {
+                let name_a = a
+                    .content_summary
+                    .id
+                    .as_deref()
+                    .or(a.content_summary.name.as_deref())
+                    .unwrap_or(&*a.filename);
+                let name_b = b
+                    .content_summary
+                    .id
+                    .as_deref()
+                    .or(b.content_summary.name.as_deref())
+                    .unwrap_or(&*b.filename);
+                lexical_sort::natural_lexical_cmp(name_a, name_b)
+            }
+            InstanceContentSortKey::Filename => {
+                let name_a = &*a.filename;
+                let name_b = &*b.filename;
+                lexical_sort::natural_lexical_cmp(name_a, name_b)
+            }
+            InstanceContentSortKey::ModifiedTime => {
+                a.modified_unix_ms.cmp(&b.modified_unix_ms).reverse()
+            }
+            InstanceContentSortKey::FileSize => a
+                .content_summary
+                .filesize
+                .unwrap_or(0)
+                .cmp(&b.content_summary.filesize.unwrap_or(0))
+                .reverse(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreferredAddContentSource {
+    #[default]
+    Modrinth,
+    CurseForge,
+    File,
+}
+
+pub const DEFAULT_PLAYER_MODEL_ZOOM: i32 = 100;
+
+fn default_zoom() -> i32 {
+    DEFAULT_PLAYER_MODEL_ZOOM
+}
+
+fn default_modrinth_project_type() -> ModrinthProjectType {
+    ModrinthProjectType::Mod
+}
+
+fn default_curseforge_class_id() -> CurseforgeClassId {
+    CurseforgeClassId::Mod
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            language: Default::default(),
+            active_theme: Default::default(),
+            first_run: true,
+            font_family: None,
+            font_size: None,
+            main_window_bounds: Default::default(),
+            sidebar_width: Default::default(),
+            main_page: Default::default(),
+            page_path: Default::default(),
+            import_launcher_dirs: Default::default(),
+            quick_delete_mods: Default::default(),
+            quick_delete_instance: Default::default(),
+            preferred_add_content_source: Default::default(),
+            instance_mods_sort_key: Default::default(),
+            instance_mods_sort_enabled_first: Default::default(),
+            instance_resourcepacks_sort_key: Default::default(),
+            instance_resourcepacks_sort_enabled_first: Default::default(),
+            instance_shaders_sort_key: Default::default(),
+            instance_shaders_sort_enabled_first: Default::default(),
+            content_install_latest: true,
+            content_filter_version: Default::default(),
+            modrinth_page_project_type: default_modrinth_project_type(),
+            curseforge_page_class_id: default_curseforge_class_id(),
+            hide_main_window_on_launch: false,
+            live_game_output_display: LiveGameOutputDisplay::default(),
+            quit_on_main_closed: false,
+            use_os_titlebar: false,
+            hide_server_addresses: false,
+            hide_usernames: false,
+            hide_skins: false,
+            show_snapshots_in_create_instance: Default::default(),
+            instances_view_mode: Default::default(),
+            instance_subpage: Default::default(),
+            collapse_capes_in_skins_page: false,
+            skin_list_sort_desc: false,
+            skin_list_show_3d: true,
+            player_model_zoom: default_zoom(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowBounds {
+    #[default]
+    Inherit,
+    Windowed {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Maximized {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Fullscreen {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::EnumIter)]
+#[serde(rename_all = "lowercase")]
+pub enum InstancesViewMode {
+    #[default]
+    Cards,
+    List,
+}
+
+impl InstancesViewMode {
+    pub fn name(self) -> DropdownName {
+        match self {
+            InstancesViewMode::Cards => DropdownName::translated(t::common::layout::cards),
+            InstancesViewMode::List => DropdownName::translated(t::common::layout::list),
+        }
+    }
+}
+
+impl InterfaceConfig {
+    pub fn init(cx: &mut App, path: Arc<Path>) {
+        cx.set_global(InterfaceConfigHolder {
+            config: try_read_json(&path),
+            write_task: None,
+            path,
+        });
+    }
+
+    pub fn get(cx: &App) -> &Self {
+        &cx.global::<InterfaceConfigHolder>().config
+    }
+
+    pub fn force_save(cx: &mut App) {
+        cx.global_mut::<InterfaceConfigHolder>().write_to_disk();
+    }
+
+    pub fn get_mut(cx: &mut App) -> &mut Self {
+        if cx.global::<InterfaceConfigHolder>().write_task.is_none() {
+            let task = cx.spawn(async |app| {
+                app.background_executor()
+                    .timer(Duration::from_secs(5))
+                    .await;
+                _ = app.update_global::<InterfaceConfigHolder, _>(|holder, _| {
+                    holder.write_to_disk();
+                });
+            });
+
+            let holder = cx.global_mut::<InterfaceConfigHolder>();
+            holder.write_task = Some(task);
+            &mut holder.config
+        } else {
+            &mut cx.global_mut::<InterfaceConfigHolder>().config
+        }
+    }
+}
+
+impl InterfaceConfigHolder {
+    fn write_to_disk(&mut self) {
+        self.write_task = None;
+        let Ok(bytes) = serde_json::to_vec(&self.config) else {
+            return;
+        };
+        _ = write_safe(&self.path, &bytes);
+    }
+}
+
+pub(crate) fn try_read_json<T: std::fmt::Debug + Default + for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> T {
+    let Ok(data) = std::fs::read(path) else {
+        return T::default();
+    };
+    serde_json::from_slice(&data).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_dark_and_vexora_dark_stay_distinct() {
+        // "Default Dark" is stored as None (falls back to the built-in
+        // default dark theme); every other theme is stored by name.
+        let mut config = InterfaceConfig::default();
+        config.set_active_theme("Default Dark".into());
+        assert_eq!(config.active_theme, None);
+
+        config.set_active_theme("Vexora Dark".into());
+        assert_eq!(config.active_theme.as_deref(), Some("Vexora Dark"));
+
+        config.set_active_theme("Vexora Arctic".into());
+        assert_eq!(config.active_theme.as_deref(), Some("Vexora Arctic"));
+
+        // Selecting Default Dark again must clear back to None, never to
+        // some other theme.
+        config.set_active_theme("Default Dark".into());
+        assert_eq!(config.active_theme, None);
+    }
+
+    #[test]
+    fn first_run_defaults_true_but_missing_key_means_existing_user() {
+        // Fresh installs (InterfaceConfig::default) get the one-time
+        // Vexora Dark default...
+        assert!(InterfaceConfig::default().first_run);
+
+        // ...while existing interface.json files written before the flag
+        // existed must NOT be treated as first run (missing key -> false),
+        // so their saved theme is never overwritten.
+        let parsed: InterfaceConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!parsed.first_run);
+
+        // And the flag round-trips once saved.
+        let mut config = InterfaceConfig::default();
+        config.first_run = false;
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: InterfaceConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.first_run);
+    }
+
+    #[test]
+    fn new_content_preview_and_import_prefs_persist() {
+        let mut config = InterfaceConfig::default();
+        config.content_install_latest = false;
+        config.content_filter_version = true;
+        config.show_snapshots_in_create_instance = true;
+        config.preferred_add_content_source = PreferredAddContentSource::File;
+        config.player_model_zoom = 150;
+        config
+            .import_launcher_dirs
+            .insert("Prism".to_string(), "C:\\PrismLauncher".to_string());
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: InterfaceConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(!parsed.content_install_latest);
+        assert!(parsed.content_filter_version);
+        assert!(parsed.show_snapshots_in_create_instance);
+        assert_eq!(
+            parsed.preferred_add_content_source,
+            PreferredAddContentSource::File
+        );
+        assert_eq!(parsed.player_model_zoom, 150);
+        assert_eq!(
+            parsed.import_launcher_dirs.get("Prism").map(String::as_str),
+            Some("C:\\PrismLauncher")
+        );
+    }
+}
+
+pub(crate) fn write_safe(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut temp = path.to_path_buf();
+    temp.add_extension(format!("{}", rand::thread_rng().next_u32()));
+    temp.add_extension("new");
+
+    let mut temp_file = std::fs::File::create(&temp)?;
+
+    temp_file.write_all(content)?;
+    temp_file.flush()?;
+    temp_file.sync_all()?;
+
+    drop(temp_file);
+
+    if let Err(err) = std::fs::rename(&temp, path) {
+        _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+
+    Ok(())
+}
